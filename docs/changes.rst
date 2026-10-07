@@ -3,6 +3,20 @@
 Change Log
 ==========
 
+Release 2.24.1 (under development)
+----------------------------------
+
+* Fixed close propagation for connections established over ProxyCommand
+  tunnels and chains of SSH tunnels. A ProxyCommand process exiting
+  without a connection-lost notification from its stdout pipe now still
+  propagates the close up to the SSH connection, so wait_closed() always
+  completes in a finite number of steps. Non-zero exit statuses and
+  signal terminations are reported as distinct ConnectionLost reasons,
+  data and pipe-close events on stdin and stderr are ignored, and
+  repeated calls to close() and wait_closed() no longer release the
+  underlying transport or tunnel more than once or affect other
+  independent connections.
+
 Release 2.24.0 (27 Jun 2026)
 ----------------------------
 

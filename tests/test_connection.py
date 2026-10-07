@@ -24,12 +24,14 @@ import asyncio
 from copy import copy
 import os
 from pathlib import Path
+import signal
 import socket
 import sys
 import unittest
 from unittest.mock import patch
 
 import asyncssh
+from asyncssh.connection import _open_proxy
 from asyncssh.constants import MSG_IGNORE, MSG_DEBUG
 from asyncssh.constants import MSG_SERVICE_REQUEST, MSG_SERVICE_ACCEPT
 from asyncssh.constants import MSG_KEXINIT, MSG_NEWKEYS
@@ -53,9 +55,95 @@ from asyncssh.public_key import get_default_x509_certificate_algs
 
 from .server import Server, ServerTestCase
 
-from .util import asynctest, patch_extra_kex, patch_getaddrinfo
-from .util import patch_getnameinfo, patch_gss
+from .util import AsyncTestCase, asynctest, patch_extra_kex
+from .util import patch_getaddrinfo, patch_getnameinfo, patch_gss
 from .util import gss_available, nc_available, x509_available
+
+# SIGKILL is unavailable on Windows before Python 3.11; os.kill with
+# SIGTERM maps to TerminateProcess there and forcefully ends the process
+# just the same for the purposes of these tests.
+_kill_signal = getattr(signal, 'SIGKILL', signal.SIGTERM)
+
+
+# A portable ProxyCommand: relays unbuffered binary stdin/stdout to a
+# TCP connection, used in place of the external 'nc' utility.
+_PROXY_RELAY = """\
+import os, socket, sys, threading
+
+sock = socket.create_connection((sys.argv[1], int(sys.argv[2])))
+
+def _stdin_to_sock():
+    while True:
+        data = os.read(0, 65536)
+        if not data:
+            try:
+                sock.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+            break
+        try:
+            sock.sendall(data)
+        except OSError:
+            break
+
+def _sock_to_stdout():
+    while True:
+        try:
+            data = sock.recv(65536)
+        except OSError:
+            break
+        if not data:
+            break
+        view = memoryview(data)
+        while view:
+            n = os.write(1, view)
+            view = view[n:]
+
+threading.Thread(target=_stdin_to_sock, daemon=True).start()
+t = threading.Thread(target=_sock_to_stdout, daemon=True)
+t.start()
+t.join()
+os._exit(0)
+"""
+
+
+class _ProxyCloseClient(asyncssh.SSHClient):
+    """Client which records the connection_lost reason"""
+
+    def __init__(self):
+        self.lost_exc = 'pending'
+
+    def connection_lost(self, exc):
+        """Record the exception passed when the connection is lost"""
+
+        self.lost_exc = exc
+
+
+class _FakeProxyConn:
+    """Stand-in for an SSH connection driven by the proxy tunnel"""
+
+    def __init__(self):
+        self.transport = None
+        self.data = []
+        self.lost = []
+
+    def connection_made(self, transport):
+        """Record the tunnel transport"""
+
+        self.transport = transport
+
+    def data_received(self, data):
+        """Record data received"""
+
+        self.data.append(data)
+
+    def connection_lost(self, exc):
+        """Record connection-lost notifications"""
+
+        self.lost.append(exc)
+
+    def set_tunnel(self, tunnel):
+        """Ignore tunnel association"""
 
 
 class _CheckAlgsClientConnection(asyncssh.SSHClientConnection):
@@ -679,6 +767,167 @@ class _TestConnection(ServerTestCase):
 
         with self.assertRaises((OSError, asyncssh.ConnectionLost)):
             await self.connect(proxy_command=proxy_command)
+
+    def _get_proxy_command(self):
+        """Return a portable proxy command relaying to the test server"""
+
+        try:
+            return self._proxy_command
+        except AttributeError:
+            with open('proxy_relay', 'w', newline='\n') as relay:
+                relay.write(_PROXY_RELAY)
+
+            self._proxy_command = (sys.executable, 'proxy_relay',
+                                   self._server_addr,
+                                   str(self._server_port))
+            return self._proxy_command
+
+    @asynctest
+    async def test_proxy_abnormal_exit(self):
+        """Test a proxy command exiting with a non-zero status"""
+
+        proxy_command = (sys.executable, '-c', 'import sys; sys.exit(7)')
+
+        with self.assertRaises(asyncssh.ConnectionLost):
+            await self.connect(proxy_command=proxy_command)
+
+    @asynctest
+    async def test_proxy_clean_close(self):
+        """Test a clean close through a proxy command"""
+
+        conn, client = await self.create_connection(
+            _ProxyCloseClient, proxy_command=self._get_proxy_command())
+
+        conn.close()
+        await conn.wait_closed()
+
+        self.assertIsNone(client.lost_exc)
+
+    @asynctest
+    async def test_proxy_close_idempotent(self):
+        """Test repeated close and wait_closed through a proxy command"""
+
+        conn, client = await self.create_connection(
+            _ProxyCloseClient, proxy_command=self._get_proxy_command())
+
+        conn.close()
+        conn.close()
+        conn.abort()
+
+        await conn.wait_closed()
+        await conn.wait_closed()
+
+        self.assertTrue(conn.is_closed())
+        self.assertIsNone(client.lost_exc)
+
+    @asynctest
+    async def test_proxy_killed(self):
+        """Test close propagation when the proxy process is killed"""
+
+        conn, client = await self.create_connection(
+            _ProxyCloseClient, proxy_command=self._get_proxy_command())
+
+        proc = conn.get_extra_info('subprocess')
+        self.assertIsNotNone(proc)
+
+        os.kill(proc.pid, _kill_signal)
+
+        await asyncio.wait_for(conn.wait_closed(), timeout=10)
+
+        self.assertTrue(conn.is_closed())
+        self.assertIsNotNone(client.lost_exc)
+        self.assertIsInstance(client.lost_exc, Exception)
+
+    @asynctest
+    async def test_proxy_wait_closed_before_close(self):
+        """Test wait_closed unblocks when the proxy exits unexpectedly"""
+
+        conn, client = await self.create_connection(
+            _ProxyCloseClient, proxy_command=self._get_proxy_command())
+
+        proc = conn.get_extra_info('subprocess')
+        wait_task = asyncio.ensure_future(conn.wait_closed())
+
+        await asyncio.sleep(0.5)
+        self.assertFalse(wait_task.done())
+
+        os.kill(proc.pid, _kill_signal)
+
+        await asyncio.wait_for(wait_task, timeout=10)
+        self.assertIsNotNone(client.lost_exc)
+
+    @asynctest
+    async def test_tunnel_close_propagation(self):
+        """Test that closing an SSH hop closes the tunneled connection"""
+
+        async with self.connect() as hop:
+            conn, client = await self.create_connection(
+                _ProxyCloseClient, tunnel=hop)
+
+            hop.close()
+
+            await asyncio.wait_for(conn.wait_closed(), timeout=10)
+
+            self.assertTrue(conn.is_closed())
+            self.assertIsNotNone(client.lost_exc)
+
+    @asynctest
+    async def test_tunnel_not_owned(self):
+        """Test that an externally-provided tunnel is not closed"""
+
+        async with self.connect() as hop:
+            async with self.connect(tunnel=hop):
+                pass
+
+            self.assertFalse(hop.is_closed())
+
+    @asynctest
+    async def test_tunnel_shared(self):
+        """Test independent connections sharing a tunnel object"""
+
+        async with self.connect() as hop:
+            async with self.connect(tunnel=hop) as conn1:
+                async with self.connect(tunnel=hop) as conn2:
+                    conn1.close()
+                    await conn1.wait_closed()
+
+                    self.assertFalse(hop.is_closed())
+                    self.assertFalse(conn2.is_closed())
+
+            self.assertFalse(hop.is_closed())
+
+    @asynctest
+    async def test_multihop_chain_close(self):
+        """Test close unwinding a multi-hop ProxyJump chain"""
+
+        tunnels = (f'localhost:{self._server_port},'
+                   f'localhost:{self._server_port}')
+
+        async with self.connect(tunnel=tunnels) as conn:
+            self.assertFalse(conn.is_closed())
+
+        self.assertTrue(conn.is_closed())
+
+    @asynctest
+    async def test_owned_tunnel_chain_bottom_up(self):
+        """Test close propagating up through an owned tunnel chain"""
+
+        hop0 = await self.connect()
+        hop1 = await self.connect(tunnel=hop0)
+        hop1.set_tunnel(hop0)
+        conn = await self.connect(tunnel=hop1)
+        conn.set_tunnel(hop1)
+
+        hop0.abort()
+
+        await asyncio.wait_for(asyncio.gather(hop1.wait_closed(),
+                                              conn.wait_closed()),
+                               timeout=10)
+
+        self.assertTrue(hop1.is_closed())
+        self.assertTrue(conn.is_closed())
+
+        await hop0.wait_closed()
 
     @asynctest
     async def test_known_hosts_not_present(self):
@@ -2854,3 +3103,156 @@ class _TestCanonicalizeHost(ServerTestCase):
                                canonical_domains=['test'],
                                canonicalize_permitted_cnames= \
                                    ['*.xxx:*.test:*.xxx'])
+
+
+class _TestProxyCommandTunnel(AsyncTestCase):
+    """Unit tests for the ProxyCommand subprocess tunnel"""
+
+    @staticmethod
+    def _sleep_command():
+        """Return a proxy command which idles until it is killed"""
+
+        return (sys.executable, '-c',
+                'import sys,time; sys.stderr.write("x"); '
+                'sys.stderr.flush(); time.sleep(30)')
+
+    async def _open_tunnel(self, command=None):
+        """Open a proxy tunnel backed by a fake connection"""
+
+        conn = _FakeProxyConn()
+        await _open_proxy(self.loop, command or self._sleep_command(),
+                          lambda: conn)
+        return conn, conn.transport
+
+    @asynctest
+    async def test_process_exit_without_pipe_close(self):
+        """Process exit without pipe close propagates with exit reason"""
+
+        conn, tunnel = await self._open_tunnel()
+
+        await asyncio.sleep(0.5)
+
+        self.assertEqual(conn.data, [])
+        self.assertEqual(conn.lost, [])
+
+        # Loss of the stdin and stderr pipes must not propagate close
+
+        tunnel.pipe_connection_lost(0, None)
+        tunnel.pipe_connection_lost(2, None)
+        self.assertEqual(conn.lost, [])
+
+        # Process exits with status 7 before stdout reports loss:
+        # close propagation must still happen with a distinct reason
+
+        tunnel._transport.get_returncode = lambda: 7
+        tunnel.process_exited()
+
+        self.assertEqual(len(conn.lost), 1)
+        self.assertIsInstance(conn.lost[0], asyncssh.ConnectionLost)
+        self.assertIn('status 7', conn.lost[0].reason)
+
+        # Repeated exit/pipe notifications must not notify again
+
+        tunnel.process_exited()
+        tunnel.pipe_data_received(1, b'garbage')
+        tunnel.pipe_connection_lost(1, None)
+        self.assertEqual(len(conn.lost), 1)
+
+        # close and wait_closed must be idempotent
+
+        tunnel.close()
+        await tunnel.wait_closed()
+        tunnel.close()
+        await tunnel.wait_closed()
+
+    @asynctest
+    async def test_process_killed_by_signal(self):
+        """A negative exit status is reported as death by signal"""
+
+        conn, tunnel = await self._open_tunnel()
+
+        tunnel._transport.get_returncode = lambda: -9
+        tunnel.process_exited()
+
+        self.assertEqual(len(conn.lost), 1)
+        self.assertIsInstance(conn.lost[0], asyncssh.ConnectionLost)
+        self.assertIn('signal 9', conn.lost[0].reason)
+
+        tunnel.close()
+        await tunnel.wait_closed()
+
+    @asynctest
+    async def test_clean_process_exit(self):
+        """A zero exit status without pipe loss closes without error"""
+
+        conn, tunnel = await self._open_tunnel()
+
+        tunnel._transport.get_returncode = lambda: 0
+        tunnel.process_exited()
+
+        self.assertEqual(conn.lost, [None])
+
+        tunnel.close()
+        await tunnel.wait_closed()
+
+    @asynctest
+    async def test_stdout_pipe_close_while_running(self):
+        """Stdout EOF while the process runs closes the connection"""
+
+        conn, tunnel = await self._open_tunnel()
+
+        tunnel.pipe_connection_lost(1, None)
+        self.assertEqual(conn.lost, [None])
+
+        # A later process exit notification must be a no-op
+
+        tunnel._transport.get_returncode = lambda: 0
+        tunnel.process_exited()
+        self.assertEqual(conn.lost, [None])
+
+        tunnel.close()
+        await tunnel.wait_closed()
+
+    @asynctest
+    async def test_stdout_pipe_close_after_exit(self):
+        """Stdout EOF observed after exit uses the exit status as reason"""
+
+        conn, tunnel = await self._open_tunnel()
+
+        tunnel._transport.get_returncode = lambda: 7
+        tunnel.pipe_connection_lost(1, None)
+
+        self.assertIsInstance(conn.lost[0], asyncssh.ConnectionLost)
+        self.assertIn('status 7', conn.lost[0].reason)
+
+        tunnel.close()
+        await tunnel.wait_closed()
+
+    @asynctest
+    async def test_stdout_pipe_error(self):
+        """Stdout pipe errors propagate as the close reason"""
+
+        conn, tunnel = await self._open_tunnel()
+
+        err = ConnectionResetError()
+        tunnel.pipe_connection_lost(1, err)
+        self.assertIs(conn.lost[0], err)
+
+        tunnel.close()
+        await tunnel.wait_closed()
+
+    @asynctest
+    async def test_non_stdout_data_ignored(self):
+        """Data on pipes other than stdout must not reach the connection"""
+
+        conn, tunnel = await self._open_tunnel()
+
+        tunnel.pipe_data_received(0, b'a')
+        tunnel.pipe_data_received(2, b'b')
+        self.assertEqual(conn.data, [])
+
+        tunnel.pipe_data_received(1, b'c')
+        self.assertEqual(conn.data, [b'c'])
+
+        tunnel.close()
+        await tunnel.wait_closed()

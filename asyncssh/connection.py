@@ -359,6 +359,7 @@ async def _open_proxy(
             self._stdin: Optional[asyncio.WriteTransport] = None
             self._conn = conn_factory()
             self._close_event = asyncio.Event()
+            self._conn_notified = False
 
         def get_extra_info(self, name: str, default: Any = None) -> Any:
             """Return extra information associated with this tunnel"""
@@ -379,25 +380,73 @@ async def _open_proxy(
                                self._transport.get_pipe_transport(0))
             self._conn.connection_made(cast(asyncio.BaseTransport, self))
 
+        def _notify_conn_lost(self, exc: Optional[Exception]) -> None:
+            """Notify the SSH connection this tunnel was lost"""
+
+            if not self._conn_notified:
+                self._conn_notified = True
+                self._conn.connection_lost(exc)
+
+        def _process_exit_exc(self,
+                              returncode: Optional[int]
+                              ) -> Optional[Exception]:
+            """Build a close reason from a proxy command exit status"""
+
+            if returncode:
+                if returncode > 0:
+                    return ConnectionLost(
+                        'Proxy command exited with status '
+                        f'{returncode}')
+                else:
+                    return ConnectionLost(
+                        'Proxy command killed by signal '
+                        f'{-returncode}')
+            else:
+                return None
+
         def pipe_data_received(self, fd: int, data: bytes) -> None:
             """Handle data received from this tunnel"""
 
-            # pylint: disable=unused-argument
-
-            self._conn.data_received(data)
+            if fd == 1:
+                self._conn.data_received(data)
 
         def pipe_connection_lost(self, fd: int,
                                  exc: Optional[Exception]) -> None:
             """Handle when this tunnel is closed"""
 
-            # pylint: disable=unused-argument
+            # Only the stdout pipe carries the tunneled SSH traffic.
+            # Loss of the stdin or stderr pipes must not propagate a
+            # close to the SSH connection.
 
-            self._conn.connection_lost(exc)
+            if fd != 1:
+                return
 
-        def process_exited(self):
+            # On a clean pipe close, prefer the proxy command exit
+            # status when the process has already been observed to
+            # exit -- this tells a remote disconnect apart from an
+            # abnormal proxy termination.
+
+            if exc is None and self._transport is not None:
+                returncode = self._transport.get_returncode()
+
+                if returncode is not None:
+                    exc = self._process_exit_exc(returncode)
+
+            self._notify_conn_lost(exc)
+
+        def process_exited(self) -> None:
             """Called when the child process has exited"""
 
             self._close_event.set()
+
+            # A process exit must complete close propagation even when
+            # no pipe connection-lost notification has been (or ever
+            # will be) delivered, using the exit status to tell a clean
+            # shutdown from an abnormal proxy termination.
+
+            if not self._conn_notified and self._transport is not None:
+                self._notify_conn_lost(
+                    self._process_exit_exc(self._transport.get_returncode()))
 
         def write(self, data: bytes) -> None:
             """Write data to this tunnel"""
@@ -413,11 +462,11 @@ async def _open_proxy(
         def close(self) -> None:
             """Close this tunnel"""
 
-            if self._transport: # pragma: no cover
+            if self._transport:
                 self._transport.close()
                 self._transport = None
 
-        async def wait_closed(self):
+        async def wait_closed(self) -> None:
             """Wait for this subprocess to exit"""
 
             await self._close_event.wait()
@@ -1125,8 +1174,12 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
             self._owner = None
 
         if self._tunnel:
+            # Keep the tunnel reference so wait_closed() can still
+            # wait for its full shutdown. close() on the tunnel is
+            # idempotent, so a tunnel which is already closed (for
+            # instance because it initiated this close propagation)
+            # is not released a second time or affect other users.
             self._tunnel.close()
-            self._tunnel = None
 
         self._cancel_login_timer()
         self._close_event.set()
@@ -2896,6 +2949,9 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
 
         """
 
+        if not self._transport:
+            return
+
         self.logger.info('Closing connection')
 
         self.disconnect(DISC_BY_APPLICATION, 'Disconnected by application')
@@ -2904,17 +2960,27 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
         """Wait for this connection to close
 
            This method is a coroutine which can be called to block until
-           this connection has finished closing.
+           this connection has finished closing. It is safe to call
+           multiple times -- repeated calls simply wait for the same
+           close event and never release the underlying transport or
+           tunnel more than once.
 
         """
 
         if self._agent:
             await self._agent.wait_closed()
 
-        if self._tunnel:
-            await self._tunnel.wait_closed()
+        # Wait for this connection to finish closing first. Its cleanup
+        # is responsible for initiating the close of any associated
+        # tunnel, after which the tunnel shutdown can be awaited. This
+        # guarantees that wait_closed() completes in a finite number of
+        # steps even when the tunnel initiated the close or exits
+        # without delivering a connection-lost notification.
 
         await self._close_event.wait()
+
+        if self._tunnel:
+            await self._tunnel.wait_closed()
 
     def disconnect(self, code: int, reason: str,
                    lang: str = DEFAULT_LANG) -> None:
