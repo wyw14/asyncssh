@@ -254,6 +254,28 @@ class _ReorderReadServerHandler(SFTPServerHandler):
             await super()._process_packet(pkttype, pktid, packet)
 
 
+class _GatedReadServerHandler(SFTPServerHandler):
+    """Hold read requests at a gate except for the first one"""
+
+    _read_gate = None
+    _first_read = True
+
+    async def _process_packet(self, pkttype, pktid, packet):
+        """Delay all read requests after the first until the gate is set"""
+
+        # pylint: disable=redefined-variable-type
+
+        if pkttype == FXP_READ:
+            if type(self)._first_read:
+                type(self)._first_read = False
+                await super()._process_packet(pkttype, pktid, packet)
+            else:
+                await type(self)._read_gate.wait()
+                await super()._process_packet(pkttype, pktid, packet)
+        else:
+            await super()._process_packet(pkttype, pktid, packet)
+
+
 class _CheckPropSFTPServer(SFTPServer):
     """Return an FTP server which checks channel properties"""
 
@@ -319,6 +341,30 @@ class _SmallBlockSizeSFTPServer(SFTPServer):
         """Limit reads to return no more than 4 KB at a time"""
 
         return super().read(file_obj, offset, min(size, 4096))
+
+
+class _RangeErrorSFTPServer(SFTPServer):
+    """Return an I/O error for reads in a particular range of a file"""
+
+    async def read(self, file_obj, offset, size):
+        """Return an error for reads between 2 MB and 3 MB in a file"""
+
+        if 2*1024*1024 <= offset < 3*1024*1024:
+            raise SFTPFailure('I/O error')
+        else:
+            return super().read(file_obj, offset, size)
+
+
+class _UnsupportedRangeReadSFTPServer(SFTPServer):
+    """Return an error that range reads are not supported"""
+
+    read_count = 0
+
+    async def read(self, file_obj, offset, size):
+        """Reject all reads, counting how many are attempted"""
+
+        type(self).read_count += 1
+        raise NotImplementedError
 
 
 class _TruncateSFTPServer(SFTPServer):
@@ -2433,6 +2479,286 @@ class _TestSFTP(_CheckSFTP):
 
             remove('file')
 
+    @sftp_test
+    async def test_open_read_parallel_ranges(self, sftp):
+        """Test reading data from multiple parallel ranges"""
+
+        f = None
+
+        try:
+            data = os.urandom(256*1024)
+            self._create_file('file', data)
+
+            ranges = [(0, 40*1024), (80*1024, 40*1024),
+                      (160*1024, 40*1024)]
+
+            f = await sftp.open('file', 'rb')
+            reader = await f.read_parallel_ranges(ranges)
+
+            result = bytearray(256*1024)
+            delivered = []
+
+            async for offset, chunk in reader:
+                # Blocks never overlap - bytes aren't delivered twice
+                self.assertFalse(any(start < offset+len(chunk) and
+                                     end > offset
+                                     for start, end in delivered))
+
+                result[offset:offset+len(chunk)] = chunk
+                delivered.append((offset, offset+len(chunk)))
+
+            expected = bytearray(256*1024)
+
+            for offset, length in ranges:
+                expected[offset:offset+length] = data[offset:offset+length]
+
+            self.assertEqual(bytes(result), bytes(expected))
+        finally:
+            if f: # pragma: no branch
+                await f.close()
+
+            remove('file')
+
+    @sftp_test
+    async def test_open_read_parallel_ranges_overlap(self, sftp):
+        """Test that bytes of overlapping ranges are delivered only once"""
+
+        f = None
+
+        try:
+            data = os.urandom(128*1024)
+            self._create_file('file', data)
+
+            f = await sftp.open('file', 'rb')
+            reader = await f.read_parallel_ranges(
+                [(0, 64*1024), (32*1024, 64*1024)])
+
+            result = bytearray(96*1024)
+            total = 0
+            delivered = []
+
+            async for offset, chunk in reader:
+                self.assertFalse(any(start < offset+len(chunk) and
+                                     end > offset
+                                     for start, end in delivered))
+
+                result[offset:offset+len(chunk)] = chunk
+                total += len(chunk)
+                delivered.append((offset, offset+len(chunk)))
+
+            # Union of the overlapping ranges is 96 KB, each byte once
+            self.assertEqual(total, 96*1024)
+            self.assertEqual(bytes(result), data[:96*1024])
+        finally:
+            if f: # pragma: no branch
+                await f.close()
+
+            remove('file')
+
+    def test_open_read_parallel_ranges_cancel(self):
+        """Test cancelling one range without affecting another range"""
+
+        @sftp_test
+        async def _test_cancel(self, sftp):
+            gate = asyncio.Event()
+            _GatedReadServerHandler._read_gate = gate
+            _GatedReadServerHandler._first_read = True
+
+            f = None
+
+            try:
+                data = os.urandom(16*1024*1024)
+                self._create_file('file', data)
+
+                f = await sftp.open('file', 'rb', block_size=32768,
+                                    max_requests=4)
+                reader = await f.read_parallel_ranges(
+                    [(0, 4*1024*1024), (8*1024*1024, 4*1024*1024)])
+
+                # The first read completes; the other requests are
+                # held at the gate when the first range is cancelled
+                it = reader.__aiter__()
+                offset, _ = await it.__anext__()
+                self.assertEqual(offset, 0)
+
+                self.assertTrue(reader.cancel_range(0))
+                self.assertFalse(reader.cancel_range(0))
+
+                gate.set()
+
+                result = bytearray(4*1024*1024)
+                total = 0
+
+                async for offset, chunk in it:
+                    # Nothing from the cancelled range is delivered
+                    self.assertGreaterEqual(offset, 8*1024*1024)
+
+                    pos = offset - 8*1024*1024
+                    result[pos:pos+len(chunk)] = chunk
+                    total += len(chunk)
+
+                self.assertEqual(total, 4*1024*1024)
+                self.assertEqual(bytes(result),
+                                 data[8*1024*1024:12*1024*1024])
+            finally:
+                gate.set()
+
+                if f: # pragma: no branch
+                    await f.close()
+
+                remove('file')
+
+        with patch('asyncssh.sftp.SFTPServerHandler',
+                   _GatedReadServerHandler):
+            # pylint: disable=no-value-for-parameter
+            _test_cancel(self)
+
+    def test_open_read_parallel_ranges_cancel_shared(self):
+        """Test cancelling a range sharing requests with another range"""
+
+        @sftp_test
+        async def _test_cancel_shared(self, sftp):
+            gate = asyncio.Event()
+            _GatedReadServerHandler._read_gate = gate
+            _GatedReadServerHandler._first_read = True
+
+            f = None
+
+            try:
+                data = os.urandom(128*1024)
+                self._create_file('file', data)
+
+                f = await sftp.open('file', 'rb', block_size=32768)
+                reader = await f.read_parallel_ranges(
+                    [(0, 64*1024), (32*1024, 64*1024)])
+
+                it = reader.__aiter__()
+                await it.__anext__()
+
+                # Cancel the first range; the gated requests cover
+                # bytes still requested by the second range, so they
+                # are retained rather than reclaimed and re-requested
+                self.assertTrue(reader.cancel_range(0))
+
+                gate.set()
+
+                result = bytearray(64*1024)
+                total = 0
+
+                async for offset, chunk in it:
+                    self.assertGreaterEqual(offset, 32*1024)
+
+                    pos = offset - 32*1024
+                    result[pos:pos+len(chunk)] = chunk
+                    total += len(chunk)
+
+                self.assertEqual(total, 64*1024)
+                self.assertEqual(bytes(result),
+                                 data[32*1024:96*1024])
+            finally:
+                gate.set()
+
+                if f: # pragma: no branch
+                    await f.close()
+
+                remove('file')
+
+        with patch('asyncssh.sftp.SFTPServerHandler',
+                   _GatedReadServerHandler):
+            # pylint: disable=no-value-for-parameter
+            _test_cancel_shared(self)
+
+    def test_open_read_parallel_ranges_close(self):
+        """Test closing the file puts all range requests in a final state"""
+
+        @sftp_test
+        async def _test_close(self, sftp):
+            gate = asyncio.Event()
+            _GatedReadServerHandler._read_gate = gate
+            _GatedReadServerHandler._first_read = True
+
+            f = None
+
+            try:
+                data = os.urandom(16*1024*1024)
+                self._create_file('file', data)
+
+                f = await sftp.open('file', 'rb', block_size=32768,
+                                    max_requests=4)
+                reader = await f.read_parallel_ranges(
+                    [(0, 16*1024*1024)])
+
+                it = reader.__aiter__()
+                await it.__anext__()
+
+                # Release the gate so the server can reach the close
+                # request; the pending reads were cancelled locally
+                gate.set()
+                await f.close()
+
+                with self.assertRaises(ValueError):
+                    await it.__anext__()
+            finally:
+                gate.set()
+
+                if f: # pragma: no branch
+                    await f.close()
+
+                remove('file')
+
+        with patch('asyncssh.sftp.SFTPServerHandler',
+                   _GatedReadServerHandler):
+            # pylint: disable=no-value-for-parameter
+            _test_close(self)
+
+    @sftp_test
+    async def test_open_read_parallel_ranges_no_blocksize(self, sftp):
+        """Test multiple ranges read sequentially with no block size"""
+
+        f = None
+
+        try:
+            data = os.urandom(16)
+            self._create_file('file', data)
+
+            f = await sftp.open('file', 'rb', block_size=None)
+            reader = await f.read_parallel_ranges([(0, 5), (8, 4)])
+
+            chunks = [(offset, chunk) async for offset, chunk in reader]
+
+            self.assertEqual(chunks, [(0, data[:5]), (8, data[8:12])])
+        finally:
+            if f: # pragma: no branch
+                await f.close()
+
+            remove('file')
+
+    @sftp_test
+    async def test_open_read_parallel_ranges_invalid(self, sftp):
+        """Test reading invalid ranges"""
+
+        f = None
+
+        try:
+            self._create_file('file', b'xxxxxxxx')
+
+            f = await sftp.open('file', 'rb')
+
+            with self.assertRaises(ValueError):
+                await f.read_parallel_ranges([(0, -1)])
+
+            with self.assertRaises(ValueError):
+                await f.read_parallel_ranges([(-1, 1)])
+
+            # Zero-length ranges are ignored, leaving nothing to read
+            reader = await f.read_parallel_ranges([(0, 0)])
+            self.assertEqual([chunk async for chunk in reader], [])
+        finally:
+            if f: # pragma: no branch
+                await f.close()
+
+            remove('file')
+
     def test_open_read_out_of_order(self):
         """Test parallel read with out-of-order responses"""
 
@@ -3443,6 +3769,9 @@ class _TestSFTP(_CheckSFTP):
 
             with self.assertRaises(ValueError):
                 await f.read_parallel()
+
+            with self.assertRaises(ValueError):
+                await f.read_parallel_ranges([(0, 1)])
 
             with self.assertRaises(ValueError):
                 await f.write('')
@@ -4742,6 +5071,92 @@ class _TestSFTPSmallBlockSize(_CheckSFTP):
             self._check_file('src', 'dst')
         finally:
             remove('src dst')
+
+
+class _TestSFTPRangesError(_CheckSFTP):
+    """Unit test for an SFTP server error while reading multiple ranges"""
+
+    @classmethod
+    async def start_server(cls):
+        """Start an SFTP server which returns I/O errors in one range"""
+
+        return await cls.create_server(sftp_factory=_RangeErrorSFTPServer)
+
+    @sftp_test
+    async def test_ranges_error(self, sftp):
+        """Test that a single block error only fails its associated range"""
+
+        try:
+            self._create_file('file', 8*1024*1024*b'\0')
+
+            async with sftp.open('file', 'rb', block_size=32768,
+                                 max_requests=32) as f:
+                reader = await f.read_parallel_ranges(
+                    [(1*1024*1024, 1*1024*1024),
+                     (2*1024*1024, 1*1024*1024),
+                     (3*1024*1024, 1*1024*1024)])
+
+                result = bytearray(2*1024*1024)
+                total = 0
+
+                with self.assertRaises(SFTPFailure):
+                    async for offset, chunk in reader:
+                        # No bytes of the failed range are delivered
+                        self.assertFalse(2*1024*1024 <= offset <
+                                         3*1024*1024)
+
+                        if offset < 2*1024*1024:
+                            pos = offset - 1*1024*1024
+                        else:
+                            pos = offset - 2*1024*1024
+
+                        result[pos:pos+len(chunk)] = chunk
+                        total += len(chunk)
+
+                # The other two ranges are delivered completely and intact
+                self.assertEqual(total, 2*1024*1024)
+                self.assertEqual(bytes(result), 2*1024*1024*b'\0')
+        finally:
+            remove('file')
+
+
+class _TestSFTPRangesUnsupported(_CheckSFTP):
+    """Unit test for an SFTP server not supporting parallel range reads"""
+
+    @classmethod
+    async def start_server(cls):
+        """Start an SFTP server which rejects range reads"""
+
+        _UnsupportedRangeReadSFTPServer.read_count = 0
+
+        return await cls.create_server(
+            sftp_factory=_UnsupportedRangeReadSFTPServer)
+
+    @sftp_test
+    async def test_ranges_unsupported(self, sftp):
+        """Test fallback to sequential reads when parallel reads unsupported"""
+
+        try:
+            self._create_file('file', 256*1024*b'\0')
+
+            async with sftp.open('file', 'rb') as f:
+                reader = await f.read_parallel_ranges(
+                    [(0, 4*1024*1024), (8*1024*1024, 4*1024*1024)])
+
+                chunks = []
+
+                with self.assertRaises(SFTPOpUnsupported):
+                    async for offset, chunk in reader:
+                        chunks.append((offset, chunk))
+
+                # No fabricated chunk data is delivered
+                self.assertEqual(chunks, [])
+
+            # Parallel reads were attempted and then sequential ones
+            self.assertGreaterEqual(_UnsupportedRangeReadSFTPServer.read_count,
+                                    3)
+        finally:
+            remove('file')
 
 
 class _TestSFTPEOFDuringCopy(_CheckSFTP):

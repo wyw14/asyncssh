@@ -816,6 +816,403 @@ class _SFTPFileReader(_SFTPParallelIO[bytes]):
         return bytes(result)
 
 
+_Range = Tuple[int, int]
+
+
+def _merge_ranges(ranges: Iterable[_Range]) -> List[_Range]:
+    """Merge possibly overlapping ranges into sorted, disjoint ranges"""
+
+    result: List[_Range] = []
+
+    for start, end in sorted(ranges):
+        if result and start <= result[-1][1]:
+            if end > result[-1][1]:
+                result[-1] = (result[-1][0], end)
+        else:
+            result.append((start, end))
+
+    return result
+
+
+def _intersect_ranges(ranges: Sequence[_Range],
+                      other: Sequence[_Range]) -> List[_Range]:
+    """Return the intersections of two sets of disjoint ranges"""
+
+    result: List[_Range] = []
+
+    i = j = 0
+
+    while i < len(ranges) and j < len(other):
+        start, end = ranges[i]
+        ostart, oend = other[j]
+
+        istart, iend = max(start, ostart), min(end, oend)
+
+        if istart < iend:
+            result.append((istart, iend))
+
+        if end < oend:
+            i += 1
+        else:
+            j += 1
+
+    return result
+
+
+def _subtract_ranges(ranges: Iterable[_Range],
+                     removed: Sequence[_Range]) -> List[_Range]:
+    """Subtract a set of disjoint ranges from another set of ranges"""
+
+    result: List[_Range] = []
+
+    for start, end in ranges:
+        parts: List[_Range] = [(start, end)]
+
+        for rstart, rend in removed:
+            new_parts: List[_Range] = []
+
+            for pstart, pend in parts:
+                if rend <= pstart or rstart >= pend:
+                    new_parts.append((pstart, pend))
+                else:
+                    if rstart > pstart:
+                        new_parts.append((pstart, rstart))
+
+                    if rend < pend:
+                        new_parts.append((rend, pend))
+
+            parts = new_parts
+
+        result.extend(parts)
+
+    return result
+
+
+class _SFTPRangesReader:
+    """Parallel reader for multiple byte ranges of a remote SFTP file
+
+       This class issues parallel read requests to fetch the data in a
+       set of byte ranges. Overlapping ranges are merged so that each
+       byte of the file is requested and delivered only once. Results
+       are returned as tuples of offset and data bytes and may be
+       delivered out of order; callers reassemble them using the
+       offsets.
+
+       Individual ranges can be cancelled without affecting other
+       ranges. Pending requests belonging solely to cancelled or
+       failed ranges are reclaimed, while requests that also cover
+       active ranges are allowed to complete and their results are
+       clipped to the bytes still requested.
+
+    """
+
+    def __init__(self, block_size: int, max_requests: int,
+                 handler: 'SFTPClientHandler', file: 'SFTPClientFile',
+                 ranges: Iterable[_Range]):
+        # Per-range state: [offset, end, state]
+        self._ranges: List[List[Union[int, str]]] = []
+
+        for offset, length in ranges:
+            if offset < 0 or length < 0:
+                raise ValueError('Invalid read range')
+
+            if length:
+                self._ranges.append([offset, offset + length, 'active'])
+
+        self._handler = handler
+        self._file = file
+
+        self._delivered: List[_Range] = []
+        self._pending: Dict['asyncio.Task[bytes]', _Range] = {}
+        self._queue: List[Tuple[int, bytes]] = []
+
+        self._needed: List[_Range] = self._active_ranges()
+
+        if block_size:
+            self._sequential = False
+            self._block_size = block_size
+            self._max_requests = max_requests
+        else:
+            # No block size - read one range at a time, sequentially
+            self._sequential = True
+            self._block_size = 0
+            self._max_requests = 1
+
+        self._waiter: Optional['asyncio.Future[None]'] = None
+        self._pump_task: Optional['asyncio.Task[None]'] = None
+        self._done = False
+        self._exc: Optional[Exception] = None
+        self._closing = False
+
+        file._register_reader(self)
+
+    def __aiter__(self) -> Self:
+        """Return this object as an async iterator"""
+
+        return self
+
+    async def __anext__(self) -> Tuple[int, bytes]:
+        """Return the next block of data or raise when iteration is done"""
+
+        while not self._queue:
+            if self._done:
+                if self._exc is not None:
+                    raise self._exc
+
+                raise StopAsyncIteration
+
+            self._ensure_pump()
+
+            if self._waiter is None:
+                self._waiter = asyncio.get_event_loop().create_future()
+
+            try:
+                await self._waiter
+            except asyncio.CancelledError:
+                # Consumer abandoned iteration - reclaim pending requests
+                self._waiter = None
+                self._abandon()
+                raise
+
+            self._waiter = None
+
+        return self._queue.pop(0)
+
+    def _abandon(self) -> None:
+        """Reclaim all unfinished requests when iteration is abandoned"""
+
+        if not self._done:
+            self._closing = True
+
+            for task in self._pending:
+                task.cancel()
+
+    def _ensure_pump(self) -> None:
+        """Start the background pump task if it isn't already running"""
+
+        if self._pump_task is None and not self._done:
+            self._pump_task = asyncio.ensure_future(self._pump())
+
+    def _active_ranges(self) -> List[_Range]:
+        """Return the merged ranges of all currently active ranges"""
+
+        return _merge_ranges(cast(Iterable[_Range],
+            ((entry[0], entry[1]) for entry in self._ranges
+             if entry[2] == 'active')))
+
+    def _pending_ranges(self) -> List[_Range]:
+        """Return the merged ranges of bytes covered by pending requests"""
+
+        return _merge_ranges((offset, offset + size)
+                             for offset, size in self._pending.values())
+
+    def _recompute_needed(self) -> None:
+        """Recompute bytes still to read, reclaiming unneeded requests"""
+
+        active_needed = _subtract_ranges(self._active_ranges(),
+                                         self._delivered)
+
+        for task, (offset, size) in list(self._pending.items()):
+            if not _intersect_ranges([(offset, offset + size)],
+                                     active_needed):
+                # This request is no longer needed by any active range
+                self._pending.pop(task)
+                task.cancel()
+
+        self._needed = _merge_ranges(
+            _subtract_ranges(active_needed, self._pending_ranges()))
+
+    def _spawn_blocks(self) -> None:
+        """Issue read requests for bytes that are still needed"""
+
+        if self._closing:
+            return
+
+        limit = 1 if self._sequential else self._max_requests
+
+        while self._needed and len(self._pending) < limit:
+            start, end = self._needed[0]
+
+            if self._block_size:
+                stop = min(start + self._block_size, end)
+            else:
+                stop = end
+
+            if stop == end:
+                self._needed.pop(0)
+            else:
+                self._needed[0] = (stop, end)
+
+            task = asyncio.ensure_future(
+                self._read_block(start, stop-start))
+            self._pending[task] = (start, stop-start)
+
+    async def _read_block(self, offset: int, size: int) -> bytes:
+        """Issue a read request for a particular block and return its data"""
+
+        data, _ = await self._handler.read(
+            self._file.handle, offset, size)
+        return data
+
+    def _mark_ranges_done(self) -> None:
+        """Mark ranges as done once all their bytes have been delivered"""
+
+        for entry in self._ranges:
+            if entry[2] == 'active' and \
+                    not _subtract_ranges([(cast(int, entry[0]),
+                                          cast(int, entry[1]))],
+                                         self._delivered):
+                entry[2] = 'done'
+
+    def _fail_ranges(self, offset: int, size: int, exc: Exception) -> None:
+        """Fail the active ranges containing the bytes of a failed request"""
+
+        end = offset + size
+
+        if self._exc is None and \
+                _intersect_ranges([(offset, end)], self._active_ranges()):
+            self._exc = exc
+
+        for entry in self._ranges:
+            if entry[2] == 'active' and \
+                    cast(int, entry[0]) < end and cast(int, entry[1]) > offset:
+                entry[2] = 'failed'
+
+        self._recompute_needed()
+
+    def _process_block(self, task: 'asyncio.Task[bytes]') -> None:
+        """Process the results of a completed read request"""
+
+        block = self._pending.pop(task, None)
+
+        if block is None:
+            # Already reclaimed while processing another completed block
+            return
+
+        offset, size = block
+
+        try:
+            data = task.result()
+        except asyncio.CancelledError:
+            # Reclaimed by a range cancellation, failure, or file close
+            return
+        except SFTPEOFError:
+            self._needed = []
+            return
+        except SFTPOpUnsupported as exc:
+            if not self._sequential:
+                # Server can't handle parallel range reads - fall back to
+                # the sequential read behavior instead of faking chunks
+                self._sequential = True
+                self._max_requests = 1
+                self._recompute_needed()
+            else:
+                self._fail_ranges(offset, size, exc)
+
+            return
+        except (OSError, SFTPError) as exc:
+            self._fail_ranges(offset, size, exc)
+            return
+
+        count = len(data)
+
+        if not count:
+            # Empty response with no EOF status means the file has ended
+            self._needed = []
+            return
+
+        # Deliver only bytes still requested and not already delivered
+        wanted = _intersect_ranges([(offset, offset + count)],
+                                   self._active_ranges())
+        wanted = _subtract_ranges(wanted, self._delivered)
+
+        for start, end in wanted:
+            self._queue.append((start, data[start-offset:end-offset]))
+            self._delivered = _merge_ranges(
+                self._delivered + [(start, end)])
+
+        # Undelivered bytes of this block which are still requested
+        # get re-read (handles short reads and clipped blocks)
+        remaining = _intersect_ranges([(offset, offset + size)],
+                                      self._active_ranges())
+        remaining = _subtract_ranges(remaining, self._delivered)
+
+        self._needed = _merge_ranges(self._needed + remaining)
+
+        self._mark_ranges_done()
+
+    async def _pump(self) -> None:
+        """Drive read requests until all active ranges reach a final state"""
+
+        try:
+            while not self._closing:
+                self._spawn_blocks()
+
+                if not self._pending:
+                    break
+
+                done, _ = await asyncio.wait(
+                    set(self._pending), return_when=asyncio.FIRST_COMPLETED)
+
+                for task in done:
+                    self._process_block(task)
+
+                # Wake the consumer to drain any newly delivered chunks
+                if self._waiter is not None and not self._waiter.done():
+                    self._waiter.set_result(None)
+        except Exception as exc: # safety net for unexpected pump errors
+            if self._exc is None:
+                self._exc = exc
+        finally:
+            for task in self._pending:
+                task.cancel()
+
+            if self._pending:
+                await asyncio.gather(*self._pending,
+                                     return_exceptions=True)
+
+            self._pending.clear()
+            self._done = True
+
+            self._file._unregister_reader(self)
+
+            if self._waiter is not None and not self._waiter.done():
+                self._waiter.set_result(None)
+
+    def cancel_range(self, index: int) -> bool:
+        """Cancel a single range by its index without affecting other ranges
+
+           This returns whether the range was active and got cancelled.
+
+        """
+
+        try:
+            entry = self._ranges[index]
+        except IndexError:
+            return False
+
+        if entry[2] != 'active':
+            return False
+
+        entry[2] = 'cancelled'
+        self._recompute_needed()
+        return True
+
+    def file_closed(self) -> None:
+        """Terminate this reader when its associated file is closed"""
+
+        if self._done:
+            return
+
+        self._closing = True
+
+        if self._exc is None:
+            self._exc = ValueError('I/O operation on closed file')
+
+        for task in self._pending:
+            task.cancel()
+
+
 class _SFTPFileWriter(_SFTPParallelIO[int]):
     """Parallelized SFTP file writer"""
 
@@ -3348,6 +3745,18 @@ class SFTPClientFile:
 
         self._max_requests = max_requests
 
+        self._readers: Set[_SFTPRangesReader] = set()
+
+    def _register_reader(self, reader: _SFTPRangesReader) -> None:
+        """Track a multi-range reader associated with this file"""
+
+        self._readers.add(reader)
+
+    def _unregister_reader(self, reader: _SFTPRangesReader) -> None:
+        """Stop tracking a multi-range reader associated with this file"""
+
+        self._readers.discard(reader)
+
     async def __aenter__(self) -> Self:
         """Allow SFTPClientFile to be used as an async context manager"""
 
@@ -3533,6 +3942,54 @@ class SFTPClientFile:
         return _SFTPFileReader(self.read_len, self._max_requests,
                                self._handler, self._handle, offset,
                                size).iter()
+
+    async def read_parallel_ranges(self, ranges: Iterable[Tuple[int, int]]) \
+            -> _SFTPRangesReader:
+        """Read data from multiple parallel ranges of the remote file
+
+           This method reads the data in a set of byte ranges, each
+           specified as a tuple of offset and length. Multiple reads
+           are issued in parallel, sharing the block size and maximum
+           request limits set when the file was opened.
+
+           Data is returned through an async iterator object which
+           yields tuples of offset and data bytes. Blocks may arrive
+           out of order; callers place the data at the provided
+           offsets to reconstruct the file.
+
+           Ranges which overlap are merged, so each byte of the file
+           is requested and delivered only once. A single range can
+           be cancelled by calling :meth:`cancel_range()
+           <_SFTPRangesReader.cancel_range>` on the returned reader
+           with its index in the list of ranges; this reclaims that
+           range's unfinished requests without cancelling other
+           ranges or affecting bytes already delivered. Closing the
+           file terminates all the range requests. If the server
+           can't perform parallel range reads, this method falls
+           back to reading the ranges sequentially rather than
+           returning misaligned chunk data.
+
+           Encoding is ignored here, since multi-byte characters may
+           be split across block boundaries.
+
+           :param ranges:
+               A list of tuples of offset and length to read
+           :type ranges: list of tuple of `int`
+
+           :returns: an async iterator of tuples of offset and data
+                     bytes, with a cancel_range() method
+
+           :raises: | :exc:`ValueError` if the file has been closed
+                      or an invalid range is provided
+                    | :exc:`SFTPError` if the server returns an error
+
+        """
+
+        if self._handle is None:
+            raise ValueError('I/O operation on closed file')
+
+        return _SFTPRangesReader(self.read_len, self._max_requests,
+                                 self._handler, self, ranges)
 
     async def write(self, data: AnyStr, offset: Optional[int] = None) -> int:
         """Write data to the remote file
@@ -3829,6 +4286,11 @@ class SFTPClientFile:
         """Close the remote file"""
 
         if self._handle:
+            # Put all multi-range readers in a terminal state before
+            # closing the file, cancelling their unfinished requests
+            for reader in list(self._readers):
+                reader.file_closed()
+
             await self._handler.close(self._handle)
             self._handle = None
 

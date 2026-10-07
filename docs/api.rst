@@ -1159,6 +1159,7 @@ SFTP Support
    ================================================= =
    .. automethod:: read
    .. automethod:: read_parallel
+   .. automethod:: read_parallel_ranges
    .. automethod:: write
    .. automethod:: seek(offset, from_what=SEEK_SET)
    .. automethod:: tell
